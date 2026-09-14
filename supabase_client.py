@@ -129,26 +129,66 @@ class SupabaseClient:
     async def upsert_batch(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Upsert a batch of product payloads (merge-duplicates).
 
-        Returns the list of rows that failed after all retries.
+        Only sends keys present on each row (never pads with None). Drops null
+        values except always requiring id/source/product_url for on_conflict.
+        Never includes embedding_version. On batch failure after retries, falls
+        back to single-row upserts.
+
+        Returns the list of rows that failed after all retries (and single-row fallback).
         """
         failed: list[dict[str, Any]] = []
         cols = await self.fetch_columns()
+        # Live Finds products table must not receive embedding_version (PGRST204).
+        cols = {c for c in cols if c != "embedding_version"}
+        required = ("id", "source", "product_url")
+
+        def _sanitize(row: dict[str, Any]) -> dict[str, Any]:
+            out: dict[str, Any] = {}
+            for k, v in row.items():
+                if k == "embedding_version" or k not in cols:
+                    continue
+                # Omit nulls for conflict-safe partial updates (except required keys).
+                if v is None and k not in required:
+                    continue
+                out[k] = v
+            for k in required:
+                if out.get(k) is None and row.get(k) is not None:
+                    out[k] = row[k]
+            return out
+
+        headers = {
+            **self.headers,
+            "Prefer": "resolution=merge-duplicates,return=minimal",
+        }
+        url = f"{self.base}?on_conflict=source,product_url"
+
+        async def _post(payload: list[dict[str, Any]]) -> None:
+            r = await self._request("POST", url, json=payload, headers=headers)
+            if r.status_code >= 300:
+                raise httpx.HTTPStatusError(
+                    f"upsert {r.status_code}", request=r.request, response=r
+                )
+
         for i in range(0, len(rows), BATCH_SIZE):
-            chunk = rows[i : i + BATCH_SIZE]
-            chunk = [{k: row.get(k) for k in cols} for row in chunk]
-            headers = {
-                **self.headers,
-                "Prefer": "resolution=merge-duplicates,return=minimal",
-            }
-            url = f"{self.base}?on_conflict=source,product_url"
+            raw_chunk = rows[i : i + BATCH_SIZE]
+            chunk: list[dict[str, Any]] = []
+            for row in raw_chunk:
+                sanitized = _sanitize(row)
+                if all(sanitized.get(k) is not None for k in required):
+                    chunk.append(sanitized)
+                else:
+                    log.error(
+                        "upsert row missing id/source/product_url: %s",
+                        {k: sanitized.get(k) for k in required},
+                    )
+                    failed.append(sanitized)
+            if not chunk:
+                continue
+
             ok = False
             for attempt in range(RETRY_ATTEMPTS):
                 try:
-                    r = await self._request("POST", url, json=chunk, headers=headers)
-                    if r.status_code >= 300:
-                        raise httpx.HTTPStatusError(
-                            f"upsert {r.status_code}", request=r.request, response=r
-                        )
+                    await _post(chunk)
                     ok = True
                     break
                 except httpx.HTTPError as exc:
@@ -161,9 +201,31 @@ class SupabaseClient:
                     )
                     if attempt < RETRY_ATTEMPTS - 1:
                         await asyncio.sleep(2 ** (attempt + 1))
-            if not ok:
-                log.error("upsert batch %d failed after %d attempts", i // BATCH_SIZE, RETRY_ATTEMPTS)
-                failed.extend(chunk)
+            if ok:
+                continue
+
+            log.warning(
+                "upsert batch %d failed after %d attempts; falling back to single-row upserts",
+                i // BATCH_SIZE,
+                RETRY_ATTEMPTS,
+            )
+            for row in chunk:
+                row_ok = False
+                for attempt in range(RETRY_ATTEMPTS):
+                    try:
+                        await _post([row])
+                        row_ok = True
+                        break
+                    except httpx.HTTPError as exc:
+                        log.warning(
+                            "single-row upsert failed (attempt %d): %s",
+                            attempt + 1,
+                            exc,
+                        )
+                        if attempt < RETRY_ATTEMPTS - 1:
+                            await asyncio.sleep(2 ** (attempt + 1))
+                if not row_ok:
+                    failed.append(row)
         return failed
 
     # ------------------------------------------------------------------ #
@@ -329,7 +391,6 @@ def build_record(
         "image_embedding": None,
         "back_image_embedding": None,
         "info_embedding": None,
-        "embedding_version": None,
         "created_at": now,
     }, metadata
 

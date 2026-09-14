@@ -165,7 +165,6 @@ async def process_product(
             vec = await _embed_image(embedder, record["image_url"]) if record["image_url"] else None
             if vec is not None:
                 payload["image_embedding"] = vec
-                payload["embedding_version"] = CONFIG.embedding_version
                 stats["front_embeddings"] += 1
         if back_needed:
             vec = await _embed_image(embedder, record["back_image_url"]) if record["back_image_url"] else None
@@ -195,6 +194,11 @@ async def process_product(
 
         is_new = existing.get(product_url) is None
         stats["new" if is_new else "updated"] += 1
+        # Always attach conflict keys for PostgREST on_conflict matching.
+        payload["id"] = record["id"]
+        payload["source"] = record["source"]
+        payload["product_url"] = record["product_url"]
+        payload.pop("embedding_version", None)
         return payload
     except Exception as exc:
         stats["errors"] += 1
